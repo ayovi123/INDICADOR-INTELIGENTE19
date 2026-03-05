@@ -1,5 +1,4 @@
 --index-url https://pypi.org/simple
-
 streamlit==1.40.0
 pandas==2.2.3
 numpy==1.24.3
@@ -15,5 +14,5 @@ joblib==1.4.2
 python-dotenv==1.0.1
 streamlit-autorefresh==1.0.1
 rich<14
-git+https://github.com/iqoptionapi/iqoptionapi.git
+iqoptionapi==7.1.1
 websocket-client==0.56
