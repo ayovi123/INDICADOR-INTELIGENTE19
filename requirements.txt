@@ -13,6 +13,6 @@ catboost==1.2.2
 joblib==1.4.2
 python-dotenv==1.0.1
 streamlit-autorefresh==1.0.1
-rich<14
-iqoptionapi==7.1.1
-websocket-client==0.56
+rich==13.9.4
+websocket-client==0.56.0
+iqoptionapi @ git+https://github.com/iqoptionapi/iqoptionapi.git@8a903cc094a74af1ed935a56a2d6b5a9ed3319d7
