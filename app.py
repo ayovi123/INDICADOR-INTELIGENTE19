@@ -1,190 +1,102 @@
-# ============================================================
 # app.py
-# Interfaz Streamlit con:
-# - Lista completa de activos OTC
-# - Cambio automático de activo si el actual está malo
-# - Tabla resumen de todos los activos
-# - Señal al segundo 58 con vencimiento
-# - Muestra el activo actual y su estado
-# ============================================================
-
 import streamlit as st
-import pandas as pd
-import numpy as np
 import time
-from datetime import datetime, timedelta
-from data_provider import (
-    conectar, obtener_velas, obtener_activos_otc,
-    generar_senal, filtro_mercado_malo,
-    presion_compradora_vendedora, fuerza_real_vela,
-    momentum_corto_plazo, detectar_tendencias_y_reversiones,
-    detectar_manipulacion_trampas, features_avanzadas
-)
+import logging
+from data_provider import get_provider
 
 # Configuración de la página
-st.set_page_config(page_title="IQ Option OTC Analyzer Pro", layout="wide")
+st.set_page_config(page_title="Bot IQ Option - Búsqueda Automática", layout="wide")
+st.title("🤖 Bot de Trading IQ Option")
+st.markdown("Búsqueda automática de activos OTC con análisis de fuerza y volumen")
 
-# Título principal
-st.title("📈 Analizador Profesional de Activos OTC - IQ Option")
-
-# Inicializar session_state
-if 'api' not in st.session_state:
-    st.session_state.api = None
-if 'activos_otc' not in st.session_state:
-    st.session_state.activos_otc = []
-if 'indice_actual' not in st.session_state:
-    st.session_state.indice_actual = 0
-if 'ultimo_analisis' not in st.session_state:
-    st.session_state.ultimo_analisis = {}
-if 'modelos_cargados' not in st.session_state:
-    st.session_state.modelos_cargados = False
-
-# Sidebar: credenciales y configuración
+# ============================================================
+# BARRA LATERAL: CONFIGURACIÓN
+# ============================================================
 with st.sidebar:
-    st.header("🔑 Conexión IQ Option")
-    email = st.text_input("Email", value="tu_email@ejemplo.com")
-    password = st.text_input("Password", type="password", value="")
-    twofa = st.text_input("2FA (si aplica)")
-    
-    if st.button("Conectar"):
-        with st.spinner("Conectando..."):
-            api = conectar(email, password, twofa if twofa else None)
-            if api:
-                st.session_state.api = api
-                st.success("Conectado")
-                # Obtener lista de activos OTC
-                with st.spinner("Obteniendo activos OTC..."):
-                    st.session_state.activos_otc = obtener_activos_otc(api)
-                    st.success(f"Se encontraron {len(st.session_state.activos_otc)} activos OTC")
-                    st.session_state.indice_actual = 0
-            else:
-                st.error("Error de conexión")
-    
-    st.header("⚙️ Opciones")
-    auto_refresh = st.checkbox("Auto-refresh (cada 5s)", value=True)
-    segundo_objetivo = st.number_input("Segundo para señal", min_value=0, max_value=59, value=58)
-    
-    # Mostrar activos disponibles
-    if st.session_state.activos_otc:
-        st.header("📊 Activos OTC disponibles")
-        st.write(f"Total: {len(st.session_state.activos_otc)}")
-        # Selector manual para debugging
-        idx = st.selectbox("Ir a activo manualmente", 
-                           range(len(st.session_state.activos_otc)),
-                           format_func=lambda i: st.session_state.activos_otc[i])
-        if st.button("Cambiar a este activo"):
-            st.session_state.indice_actual = idx
-            st.rerun()
+    st.header("⚙️ Configuración")
+    email = st.text_input("Email", type="default")
+    password = st.text_input("Contraseña", type="password")
+    tipo_activo = st.selectbox("Tipo de activo", ["digital", "turbo", "binary"], index=0)
+    intervalo_analisis = st.number_input("Intervalo entre búsquedas (segundos)", min_value=5, value=30)
+    max_activos_por_busqueda = st.number_input("Máx. activos a analizar por ciclo", min_value=1, value=10, help="Limita la cantidad para no saturar")
 
-# Área principal
-if st.session_state.api is None:
-    st.info("👈 Conéctate a IQ Option usando el panel izquierdo")
-    st.stop()
+    iniciar = st.button("🚀 Iniciar búsqueda automática")
+    detener = st.button("⏹️ Detener")
 
-if not st.session_state.activos_otc:
-    st.warning("No se encontraron activos OTC. Verifica la conexión.")
-    st.stop()
+# ============================================================
+# ÁREA PRINCIPAL: RESULTADOS
+# ============================================================
+if "activo_actual" not in st.session_state:
+    st.session_state.activo_actual = None
+if "ejecutando" not in st.session_state:
+    st.session_state.ejecutando = False
 
-# Obtener el activo actual basado en el índice
-activo_actual = st.session_state.activos_otc[st.session_state.indice_actual]
+# Contenedores para actualizar dinámicamente
+placeholder_estado = st.empty()
+placeholder_analisis = st.empty()
+placeholder_grafico = st.empty()  # Si quieres mostrar velas
 
-# Obtener velas del activo actual
-with st.spinner(f"Analizando {activo_actual}..."):
-    velas = obtener_velas(activo_actual, timeframe=60, cantidad=100)
-
-if velas is None or len(velas) == 0:
-    st.error(f"No se pudieron obtener datos para {activo_actual}")
-    # Pasar al siguiente activo automáticamente
-    st.session_state.indice_actual = (st.session_state.indice_actual + 1) % len(st.session_state.activos_otc)
-    st.rerun()
-
-# Verificar si el activo actual está en malas condiciones
-if filtro_mercado_malo(velas):
-    st.warning(f"⚠️ {activo_actual} está en mercado malo. Cambiando automáticamente...")
-    time.sleep(1)
-    st.session_state.indice_actual = (st.session_state.indice_actual + 1) % len(st.session_state.activos_otc)
-    st.rerun()
-
-# Mostrar hora actual
-now = datetime.now()
-st.header(f"🔍 Análisis en tiempo real: **{activo_actual}**  (actualización: {now.strftime('%H:%M:%S')})")
-st.caption(f"Activo {st.session_state.indice_actual+1} de {len(st.session_state.activos_otc)}")
-
-# Generar señal
-segundo_actual = now.second
-direccion, score, estado, expiracion, tipo = generar_senal(activo_actual, velas, segundo_actual)
-
-# Mostrar resultado destacado
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    if direccion == 'CALL':
-        st.success(f"🔔 SEÑAL: {direccion}")
-    elif direccion == 'PUT':
-        st.error(f"🔔 SEÑAL: {direccion}")
-    elif direccion == 'NO_OPERAR':
-        st.warning(f"⛔ NO OPERAR")
+if iniciar:
+    if not email or not password:
+        st.error("Ingresa email y contraseña")
     else:
-        st.info(f"⏳ {direccion}")
+        st.session_state.ejecutando = True
+        # Intentar conectar (el provider se conecta automáticamente al crearse)
+        try:
+            provider = get_provider(email, password)
+            if not provider.conectado:
+                st.error("No se pudo conectar a IQ Option. Revisa credenciales.")
+                st.session_state.ejecutando = False
+        except Exception as e:
+            st.error(f"Error de conexión: {e}")
+            st.session_state.ejecutando = False
 
-with col2:
-    st.metric("Score / Probabilidad", f"{score:.2%}" if score else "N/A")
+# Bucle principal (se ejecuta mientras el estado sea True)
+while st.session_state.ejecutando:
+    with placeholder_estado.container():
+        st.info(f"🔄 Buscando activos OTC ({tipo_activo})...")
+        st.caption(f"Próximo análisis en {intervalo_analisis} segundos")
 
-with col3:
-    st.metric("Estado", estado)
+    # Realizar búsqueda
+    provider = get_provider(email, password)
+    resultado = provider.buscar_mejor_activo(
+        tipo_activo=tipo_activo,
+        max_intentos=max_activos_por_busqueda
+    )
 
-with col4:
-    if expiracion:
-        st.metric("Vencimiento (próx. vela)", expiracion)
+    if resultado:
+        st.session_state.activo_actual = resultado
+        with placeholder_analisis.container():
+            st.success(f"🎯 Activo seleccionado: **{resultado['activo']}**")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Fuerza", f"{resultado['fuerza']}%")
+            with col2:
+                st.metric("Volumen rel.", f"{resultado['volumen']}x")
+            with col3:
+                st.metric("Señal IA", resultado['sentimiento'])
 
-if tipo:
-    st.info(f"**Tipo:** {tipo}")
+            # Aquí podrías mostrar un gráfico con las velas
+            # if 'velas' in resultado:
+            #     mostrar_grafico(resultado['velas'])
 
-# Métricas adicionales del activo actual
-st.subheader("📊 Métricas del activo actual")
-col1, col2, col3, col4 = st.columns(4)
-compra, venta = presion_compradora_vendedora(velas)
-col1.metric("Presión compradora", f"{compra:.2%}")
-col2.metric("Presión vendedora", f"{venta:.2%}")
-tend = detectar_tendencias_y_reversiones(velas)
-col3.metric("Tendencia", tend)
-manip = detectar_manipulacion_trampas(velas)
-col4.metric("Manipulación", f"{manip:.2%}")
+        # Aquí puedes agregar lógica de entrada automática
+        # Ejemplo: if resultado['sentimiento'] == "CALL": provider.api.buy(1, resultado['activo'], "call", 1)
+    else:
+        with placeholder_analisis.container():
+            st.warning("😕 No se encontró ningún activo con condiciones favorables en este ciclo")
 
-# Tabla resumen de TODOS los activos OTC
-st.subheader("📋 Estado de todos los activos OTC")
+    # Esperar el intervalo antes de la siguiente búsqueda
+    for i in range(intervalo_analisis, 0, -1):
+        if not st.session_state.ejecutando:
+            break
+        placeholder_estado.caption(f"Próximo análisis en {i} segundos...")
+        time.sleep(1)
 
-# Función para analizar rápidamente un activo (solo para la tabla)
-def analizar_activo_resumen(activo):
-    try:
-        v = obtener_velas(activo, timeframe=60, cantidad=50)
-        if v is None or len(v) < 20:
-            return {'activo': activo, 'estado': 'Error', 'tendencia': 'N/A', 'manip': 'N/A'}
-        malo = filtro_mercado_malo(v)
-        estado = 'Malo' if malo else 'Bueno'
-        tend = detectar_tendencias_y_reversiones(v)
-        manip = detectar_manipulacion_trampas(v)
-        return {'activo': activo, 'estado': estado, 'tendencia': tend, 'manip': f"{manip:.2%}"}
-    except:
-        return {'activo': activo, 'estado': 'Error', 'tendencia': 'N/A', 'manip': 'N/A'}
+    # Verificar si el usuario detuvo
+    if detener:
+        st.session_state.ejecutando = False
+        break
 
-# Mostrar tabla con progreso
-if st.button("Actualizar tabla completa"):
-    with st.spinner("Analizando todos los activos..."):
-        datos_resumen = []
-        for i, act in enumerate(st.session_state.activos_otc):
-            st.caption(f"Procesando {i+1}/{len(st.session_state.activos_otc)}: {act}")
-            datos_resumen.append(analizar_activo_resumen(act))
-        df_resumen = pd.DataFrame(datos_resumen)
-        st.session_state.ultimo_analisis = df_resumen
-
-if st.session_state.ultimo_analisis:
-    st.dataframe(st.session_state.ultimo_analisis, use_container_width=True)
-
-# Últimas velas del activo actual
-st.subheader(f"Últimas 10 velas de {activo_actual}")
-st.dataframe(velas[['timestamp', 'open', 'high', 'low', 'close', 'volume']].tail(10))
-
-# Auto-refresh
-if auto_refresh:
-    time.sleep(5)
-    st.rerun()
+if not st.session_state.ejecutando and 'provider' in locals():
+    st.info("Búsqueda detenida. Presiona 'Iniciar' para reanudar.")
