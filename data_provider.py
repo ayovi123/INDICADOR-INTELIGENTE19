@@ -1,162 +1,128 @@
+# data_provider.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import time
 import random
-import statistics
-from datetime import datetime, timedelta
+from iqoptionapi.stable_api import IQ_Option
 
-# ------------------------------------------------
-# SIMULADOR DE DATOS (para pruebas)
-# Reemplaza esta función con tu conexión real a broker/API
-# ------------------------------------------------
-def get_current_vela():
+# ------------------------------------------------------------
+# CONEXIÓN A IQ OPTION
+# ------------------------------------------------------------
+def conectar(email, password, twofa=""):
     """
-    Simula la obtención de la última vela de 1 minuto.
-    Devuelve un diccionario con:
-        - open: precio de apertura
-        - high: máximo
-        - low: mínimo
-        - close: precio de cierre
-        - volume: volumen (ticks)
-        - timestamp: datetime de la vela (inicio del minuto)
+    Conecta a IQ Option y devuelve el objeto API.
+    Muestra mensajes de éxito o error.
     """
-    now = datetime.now().replace(second=0, microsecond=0)
-    # Generar datos aleatorios con cierta tendencia para pruebas
-    base = 100 + random.uniform(-2, 2)
-    open_price = base
-    close_price = base + random.uniform(-1.5, 1.5)
-    high_price = max(open_price, close_price) + random.uniform(0, 0.5)
-    low_price = min(open_price, close_price) - random.uniform(0, 0.5)
-    volume = random.randint(100, 1000)
+    api = IQ_Option(email, password)
+    try:
+        if twofa:
+            check, reason = api.connect(verification_code=twofa)
+        else:
+            check, reason = api.connect()
+        
+        if check:
+            # Cambiar a cuenta demo si se desea (opcional)
+            # api.change_balance("PRACTICE")  # "PRACTICE" para demo, "REAL" para real
+            st.success("✅ Conexión exitosa a IQ Option")
+            return api
+        else:
+            st.error(f"❌ Error de conexión: {reason}")
+            return None
+    except Exception as e:
+        st.error(f"❌ Excepción: {str(e)}")
+        return None
+
+# ------------------------------------------------------------
+# OBTENER ACTIVOS OTC
+# ------------------------------------------------------------
+def obtener_activos_otc(api):
+    """
+    Retorna una lista de activos OTC disponibles.
+    """
+    try:
+        # Intentar obtener todos los activos (depende de la versión de la API)
+        todos = api.get_all_assets()
+    except AttributeError:
+        todos = api.get_all_actives()  # Método alternativo
+    
+    otc = []
+    for activo in todos:
+        nombre = activo.get('name') or activo.get('symbol') or ''
+        if 'OTC' in nombre.upper():
+            # Obtener precio actual (opcional)
+            precio = None
+            try:
+                precio = api.get_real_time_price(nombre)
+            except:
+                pass
+            otc.append({
+                'nombre': nombre,
+                'id': activo.get('id'),
+                'precio': precio
+            })
+    return otc
+
+# ------------------------------------------------------------
+# ANÁLISIS DE UN ACTIVO (REEMPLAZA CON TU LÓGICA REAL)
+# ------------------------------------------------------------
+def analizar_activo(api, activo):
+    """
+    Analiza el activo y devuelve un diccionario con:
+    - tipo: 'COMPRA' o 'VENTA'
+    - probabilidad: float (0-100)
+    - fuerza: float (porcentaje, puede ser >100)
+    - trampa: bool
+    - motivo_trampa: str
+    - motivo: str (explicación general)
+    - precaucion: str (mensaje adicional, ej: "vela grande")
+    """
+    # --- AQUÍ DEBES PONER TU ALGORITMO REAL ---
+    # Ejemplo: obtener velas, calcular indicadores, etc.
+    # Por ahora, simulamos resultados aleatorios para que puedas probar.
+    
+    # Simulación (reemplazar con lógica real)
+    tipo = random.choice(['COMPRA', 'VENTA'])
+    prob = random.uniform(0, 100)
+    fuerza = random.uniform(0, 150)
+    trampa = random.choice([True, False])
+    
+    if trampa:
+        if tipo == 'COMPRA':
+            motivo_trampa = "BAJISTA (falso breakout) → señal de COMPRA"
+        else:
+            motivo_trampa = "ALCISTA (falso breakout) → señal de VENTA"
+    else:
+        motivo_trampa = ""
+    
+    motivo = f"Análisis basado en cruce de medias y RSI. "
+    if prob > 70:
+        motivo += "Alta probabilidad."
+    else:
+        motivo += "Probabilidad moderada."
+    
+    precaucion = ""
+    if fuerza > 100:
+        precaucion = "¡PRECAUCIÓN: vela siguiente podría ser de gran tamaño (alto potencial de movimiento fuerte)!"
+    
     return {
-        'open': open_price,
-        'high': high_price,
-        'low': low_price,
-        'close': close_price,
-        'volume': volume,
-        'timestamp': now
+        'tipo': tipo,
+        'probabilidad': round(prob, 1),
+        'fuerza': round(fuerza, 1),
+        'trampa': trampa,
+        'motivo_trampa': motivo_trampa,
+        'motivo': motivo,
+        'precaucion': precaucion
     }
 
-def get_historical_velas(minutes=20):
+# ------------------------------------------------------------
+# FUNCIÓN PARA OBTENER VELAS (OPCIONAL)
+# ------------------------------------------------------------
+def obtener_velas(api, activo, timeframe=60, count=100):
     """
-    Devuelve una lista de las últimas 'minutes' velas (simuladas).
+    Obtiene velas de un activo.
+    timeframe en segundos (60 = 1 minuto).
     """
-    velas = []
-    now = datetime.now().replace(second=0, microsecond=0)
-    for i in range(minutes, 0, -1):
-        ts = now - timedelta(minutes=i)
-        # Simular datos coherentes (con tendencia aleatoria)
-        base = 100 + (i * 0.01) + random.uniform(-1, 1)
-        open_price = base
-        close_price = base + random.uniform(-1, 1)
-        high_price = max(open_price, close_price) + random.uniform(0, 0.3)
-        low_price = min(open_price, close_price) - random.uniform(0, 0.3)
-        volume = random.randint(100, 1000)
-        velas.append({
-            'open': open_price,
-            'high': high_price,
-            'low': low_price,
-            'close': close_price,
-            'volume': volume,
-            'timestamp': ts
-        })
-    return velas
-
-# ------------------------------------------------
-# CÁLCULOS TÉCNICOS
-# ------------------------------------------------
-def calcular_medias(velas):
-    """
-    Calcula medias de cuerpo y volumen de las últimas 5 velas.
-    """
-    ultimas5 = velas[-5:]
-    cuerpos = [abs(v['close'] - v['open']) for v in ultimas5]
-    volumenes = [v['volume'] for v in ultimas5]
-    cuerpo_medio = statistics.mean(cuerpos) if cuerpos else 0
-    volumen_medio = statistics.mean(volumenes) if volumenes else 0
-    return cuerpo_medio, volumen_medio
-
-def detectar_trampa(vela_actual, velas_anteriores):
-    """
-    Detecta trampas de liquidez (falsos rompimientos).
-    Retorna un string con el tipo de trampa o None.
-    """
-    if len(velas_anteriores) < 10:
-        return None
-    maximos = [v['high'] for v in velas_anteriores[-10:]]
-    minimos = [v['low'] for v in velas_anteriores[-10:]]
-    max_reciente = max(maximos)
-    min_reciente = min(minimos)
-
-    alta = vela_actual['high']
-    baja = vela_actual['low']
-    cierre = vela_actual['close']
-
-    # Trampa alcista: rompe máximo pero cierra por debajo
-    if alta > max_reciente and cierre < max_reciente:
-        return "ALCISTA (falso breakout) → señal de VENTA"
-    # Trampa bajista: rompe mínimo pero cierra por encima
-    if baja < min_reciente and cierre > min_reciente:
-        return "BAJISTA (falso breakout) → señal de COMPRA"
-    return None
-
-def calcular_probabilidad_y_fuerza(vela_actual, velas_anteriores):
-    """
-    Calcula probabilidad de compra y venta, y la fuerza (0-1).
-    Retorna (prob_compra, prob_venta, fuerza)
-    """
-    cuerpo_medio, volumen_medio = calcular_medias(velas_anteriores)
-
-    cuerpo_actual = abs(vela_actual['close'] - vela_actual['open'])
-    rango_actual = vela_actual['high'] - vela_actual['low']
-    sombra_sup = vela_actual['high'] - max(vela_actual['open'], vela_actual['close'])
-    sombra_inf = min(vela_actual['open'], vela_actual['close']) - vela_actual['low']
-
-    # Inicializar probabilidades
-    prob_compra = 0
-    prob_venta = 0
-
-    # 1. Impulso por cuerpo grande
-    if cuerpo_actual > cuerpo_medio * 1.5:
-        if vela_actual['close'] > vela_actual['open']:  # vela alcista
-            prob_compra += 30
-        else:
-            prob_venta += 30
-
-    # 2. Cierre vs apertura anterior
-    if len(velas_anteriores) >= 1:
-        vela_prev = velas_anteriores[-1]
-        if vela_actual['close'] > vela_prev['open']:
-            prob_compra += 20
-        elif vela_actual['close'] < vela_prev['open']:
-            prob_venta += 20
-
-    # 3. Sombras
-    if sombra_inf > sombra_sup:
-        prob_compra += 20
-    elif sombra_sup > sombra_inf:
-        prob_venta += 20
-
-    # 4. Volumen
-    if vela_actual['volume'] > volumen_medio:
-        if vela_actual['close'] > vela_actual['open']:
-            prob_compra += 30
-        else:
-            prob_venta += 30
-    else:
-        # Volumen bajo, pero si el cuerpo es grande, puede ser manipulación
-        if cuerpo_actual > cuerpo_medio * 2:
-            # Podría ser manipulación, pero no aumentamos probabilidad
-            pass
-
-    # Normalizar a porcentajes (que sumen 100)
-    total = prob_compra + prob_venta
-    if total > 0:
-        prob_compra = (prob_compra / total) * 100
-        prob_venta = (prob_venta / total) * 100
-    else:
-        prob_compra = 50
-        prob_venta = 50
-
-    # Calcular fuerza (un valor entre 0 y 1 basado en la claridad de la señal)
-    # Usamos la diferencia absoluta entre probabilidades normalizada
-    fuerza = abs(prob_compra - prob_venta) / 100.0  # 0 si iguales, 1 si 100% vs 0%
-
-    return prob_compra, prob_venta, fuerza
+    from time import time
+    velas = api.get_candles(activo, timeframe, count, time())
+    return pd.DataFrame(velas)
