@@ -12,10 +12,10 @@ from data_provider import EstrategiaAvanzada
 # ========== CONFIGURACIÓN ==========
 SEGUNDO_EJECUCION = 58
 VELAS_HISTORICAS = 50
-ACTIVO_DESCARGAR = "EURUSD"
+ACTIVO_DESCARGAR = "EURUSD-OTC"  # Cambiado a OTC
 TIMEFRAME = 60  # 1 minuto
 VELAS_POR_REQUEST = 1000
-NUM_REQUESTS = 500  # Ajustable (500 = 500k velas)
+LOTES_POR_DEFECTO = 500  # 500 * 1000 = 500k velas
 
 # Archivos necesarios
 MODELO_FILE = "modelo_xgb.pkl"
@@ -27,8 +27,7 @@ CSV_FILE = "iqoption_data_EURUSD_60.csv"
 def descargar_datos(api, activo, total_requests):
     """
     Descarga velas históricas usando la API ya conectada.
-    Muestra progreso en Streamlit.
-    Retorna el DataFrame con las velas.
+    Retorna DataFrame con las velas descargadas (puede estar vacío).
     """
     todas_las_velas = []
     end_from = int(time.time())
@@ -45,7 +44,6 @@ def descargar_datos(api, activo, total_requests):
                 df_batch.columns = ['from', 'open', 'high', 'low', 'close', 'volume']
                 todas_las_velas.append(df_batch)
             
-            # Actualizar progreso
             progreso.progress((i + 1) / total_requests, text=f"Descargando lote {i+1}/{total_requests}")
             time.sleep(0.3)
         except Exception as e:
@@ -55,22 +53,55 @@ def descargar_datos(api, activo, total_requests):
     progreso.empty()
     
     if not todas_las_velas:
-        return None
+        # Retornar DataFrame vacío con las columnas esperadas
+        return pd.DataFrame(columns=['from', 'open', 'high', 'low', 'close', 'volume'])
     
     df_final = pd.concat(todas_las_velas, ignore_index=True)
     df_final = df_final.drop_duplicates(subset=['from'])
     df_final = df_final.sort_values('from').reset_index(drop=True)
     return df_final
 
+def cargar_datos_existentes():
+    """Carga el CSV existente si existe, o retorna DataFrame vacío."""
+    if os.path.exists(CSV_FILE):
+        try:
+            df = pd.read_csv(CSV_FILE)
+            # Asegurar tipos
+            df['from'] = pd.to_numeric(df['from'])
+            return df
+        except:
+            return pd.DataFrame(columns=['from', 'open', 'high', 'low', 'close', 'volume'])
+    else:
+        return pd.DataFrame(columns=['from', 'open', 'high', 'low', 'close', 'volume'])
+
+def combinar_datos(df_existente, df_nuevo):
+    """Combina y elimina duplicados, ordena por 'from'."""
+    if df_existente.empty:
+        return df_nuevo
+    if df_nuevo.empty:
+        return df_existente
+    df_combinado = pd.concat([df_existente, df_nuevo], ignore_index=True)
+    df_combinado = df_combinado.drop_duplicates(subset=['from'])
+    df_combinado = df_combinado.sort_values('from').reset_index(drop=True)
+    return df_combinado
+
 def entrenar_modelo_con_datos(df):
-    """Entrena XGBoost y guarda modelo.pkl y scaler.pkl."""
+    """Entrena XGBoost y guarda modelo.pkl y scaler.pkl. Retorna (modelo, scaler) o (None,None) si falla."""
     from sklearn.preprocessing import StandardScaler
     import xgboost as xgb
     from sklearn.metrics import accuracy_score
     
+    if len(df) < 100:
+        st.warning("No hay suficientes datos para entrenar (mínimo 100 velas).")
+        return None, None
+    
     # Crear target
     df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
     df = df.dropna(subset=['target']).reset_index(drop=True)
+    
+    if len(df) < 100:
+        st.warning("Después de crear target, no hay suficientes muestras.")
+        return None, None
     
     estrategia = EstrategiaAvanzada(modelo_path=None, scaler_path=None, ventana=20)
     
@@ -85,7 +116,8 @@ def entrenar_modelo_con_datos(df):
             targets_list.append(df.iloc[i]['target'])
     
     if len(features_list) < 100:
-        raise ValueError("No hay suficientes muestras para entrenar.")
+        st.warning("No se generaron suficientes features para entrenar.")
+        return None, None
     
     X = pd.DataFrame(features_list)
     y = pd.Series(targets_list)
@@ -139,9 +171,13 @@ with st.sidebar:
         if st.button("Conectar"):
             with st.spinner("Conectando..."):
                 api = IQ_Option(email_user, password_user)
-                check, reason = api.connect()
+                try:
+                    check, reason = api.connect()
+                except Exception as e:
+                    st.error(f"Excepción durante connect(): {e}")
+                    st.stop()
+                
                 if check:
-                    # Verificación adicional: intentar obtener balance
                     try:
                         api.change_balance(tipo_cuenta)
                         balance = api.get_balance()
@@ -151,10 +187,15 @@ with st.sidebar:
                         st.success(f"✅ Conectado. Balance: {balance}")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Error al obtener balance: {e}")
+                        st.error(f"Conectado pero error al obtener balance: {e}")
+                        st.session_state.iq_api = api
+                        st.session_state.usuario_conectado = True
+                        st.session_state.email_user = email_user
+                        st.warning("Conectado, pero no se pudo verificar balance. Puede funcionar.")
+                        st.rerun()
                 else:
                     st.error(f"Error de conexión: {reason}")
-                    st.info("Verifica que tus credenciales sean correctas y que la cuenta sea válida.")
+                    st.info("Verifica credenciales y tipo de cuenta. Si usas cuenta demo, asegúrate de seleccionar PRACTICE.")
     else:
         st.success(f"Conectado como: {st.session_state.email_user}")
         if st.button("Desconectar"):
@@ -164,39 +205,70 @@ with st.sidebar:
             st.session_state.usuario_conectado = False
             st.rerun()
 
-# ========== VERIFICACIÓN DE MODELOS Y BOTÓN DE ENTRENAMIENTO ==========
+# ========== CONTROLES DE ENTRENAMIENTO (siempre visibles si conectado) ==========
+if st.session_state.usuario_conectado:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🧠 Entrenamiento de IA")
+    
+    # Selector de lotes a descargar
+    lotes_input = st.sidebar.number_input(
+        "Número de lotes a descargar (cada lote ≈ 1000 velas)",
+        min_value=1,
+        max_value=2000,
+        value=LOTES_POR_DEFECTO,
+        step=100
+    )
+    
+    if st.sidebar.button("📥 Descargar nuevos datos y reentrenar IA", type="primary"):
+        with st.status("Iniciando proceso de entrenamiento...", expanded=True) as status:
+            # 1. Cargar datos existentes
+            status.update(label="Cargando datos existentes...")
+            df_existente = cargar_datos_existentes()
+            st.write(f"Datos existentes: {len(df_existente)} velas")
+            
+            # 2. Descargar nuevos datos
+            status.update(label="Descargando nuevos datos...")
+            df_nuevo = descargar_datos(
+                st.session_state.iq_api,
+                ACTIVO_DESCARGAR,
+                int(lotes_input)
+            )
+            
+            if df_nuevo.empty:
+                status.update(label="No se descargaron velas nuevas.", state="error")
+                st.warning("La descarga no devolvió velas. Puede que el mercado esté cerrado o el activo no esté disponible.")
+                st.stop()
+            
+            st.write(f"Nuevas velas descargadas: {len(df_nuevo)}")
+            
+            # 3. Combinar
+            status.update(label="Combinando datos...")
+            df_combinado = combinar_datos(df_existente, df_nuevo)
+            st.write(f"Total después de combinar: {len(df_combinado)} velas")
+            
+            # 4. Guardar CSV
+            df_combinado.to_csv(CSV_FILE, index=False)
+            status.update(label="Datos guardados. Entrenando modelo...")
+            
+            # 5. Entrenar modelo
+            modelo, scaler = entrenar_modelo_con_datos(df_combinado)
+            
+            if modelo is None:
+                status.update(label="Entrenamiento fallido por datos insuficientes.", state="error")
+                st.stop()
+            else:
+                status.update(label="✅ Entrenamiento completado con éxito", state="complete")
+                st.success("Nuevo modelo guardado. La aplicación se recargará para usarlo.")
+                time.sleep(2)
+                st.rerun()
 
+# ========== VERIFICACIÓN DE MODELOS PARA OPERAR ==========
 modelos_existen = os.path.exists(MODELO_FILE) and os.path.exists(SCALER_FILE)
 
 if not modelos_existen:
     if st.session_state.usuario_conectado:
-        st.warning("⚠️ Los archivos del modelo de IA no existen. Debes descargar datos históricos y entrenar el modelo.")
-        if st.button("📥 Descargar datos históricos y entrenar IA", type="primary"):
-            with st.status("Iniciando proceso...", expanded=True) as status:
-                status.update(label="Descargando datos...")
-                df_descargado = descargar_datos(
-                    st.session_state.iq_api,
-                    ACTIVO_DESCARGAR,
-                    NUM_REQUESTS
-                )
-                
-                if df_descargado is None:
-                    status.update(label="Error en la descarga", state="error")
-                    st.stop()
-                
-                # Guardar CSV
-                df_descargado.to_csv(CSV_FILE, index=False)
-                status.update(label="Descarga completada. Entrenando modelo...")
-                
-                try:
-                    modelo, scaler = entrenar_modelo_con_datos(df_descargado)
-                    status.update(label="✅ Entrenamiento completado con éxito", state="complete")
-                    st.success("Modelo guardado. La aplicación se recargará para usarlo.")
-                    time.sleep(2)
-                    st.rerun()
-                except Exception as e:
-                    status.update(label=f"Error en entrenamiento: {e}", state="error")
-                    st.stop()
+        st.warning("⚠️ Los archivos del modelo de IA no existen. Usa el panel lateral para descargar datos y entrenar el modelo por primera vez.")
+        st.stop()
     else:
         st.info("🔌 Conéctate a IQ Option para poder descargar datos y entrenar el modelo.")
         st.stop()
@@ -204,6 +276,7 @@ else:
     st.success("✅ Modelo de IA cargado y listo para operar.")
 
 # ========== CLASES DEL BOT ==========
+# Solo se ejecuta si los modelos existen
 
 class DataManager:
     def __init__(self):
