@@ -2,9 +2,6 @@
 import numpy as np
 import pandas as pd
 import pickle
-import joblib
-from sklearn.preprocessing import StandardScaler
-import xgboost as xgb
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -13,20 +10,33 @@ class EstrategiaAvanzada:
     Clase que implementa la estrategia de análisis de fuerza y volumen
     con Machine Learning para velas de 1 minuto.
     """
-    def __init__(self, modelo_path='modelo_xgb.pkl', scaler_path='scaler.pkl', ventana=20):
+    def __init__(self, modelo_path=None, scaler_path=None, ventana=20):
         """
-        Carga el modelo entrenado y el scaler.
-        ventana: número de velas para calcular features.
+        Inicializa la estrategia. Si se proporcionan rutas válidas, intenta cargar el modelo.
+        Si no, la estrategia opera sin modelo (útil durante entrenamiento).
         """
         self.ventana = ventana
-        with open(modelo_path, 'rb') as f:
-            self.modelo = pickle.load(f)
-        with open(scaler_path, 'rb') as f:
-            self.scaler = pickle.load(f)
-        # Umbrales configurables
-        self.umbral_probabilidad = 0.65   # Mínimo de probabilidad para operar
-        self.umbral_fuerza = 0.5           # Mínimo de fuerza combinada
-        self.umbral_tendencia = 0.6        # Pendiente mínima para considerar tendencia clara
+        self.umbral_probabilidad = 0.65
+        self.umbral_fuerza = 0.5
+        self.umbral_tendencia = 0.6
+        self.modelo = None
+        self.scaler = None
+
+        # Solo intenta cargar si las rutas no son None
+        if modelo_path is not None and scaler_path is not None:
+            try:
+                with open(modelo_path, 'rb') as f:
+                    self.modelo = pickle.load(f)
+                with open(scaler_path, 'rb') as f:
+                    self.scaler = pickle.load(f)
+                print("Modelo y scaler cargados desde archivos.")
+            except FileNotFoundError:
+                print(f"Advertencia: Modelo o Scaler no encontrados en {modelo_path} y {scaler_path}. Operando sin IA en esta instancia.")
+            except Exception as e:
+                print(f"Error al cargar modelo/scaler: {e}. Operando sin IA en esta instancia.")
+        else:
+            # Si se pasan None, simplemente no se carga modelo (caso entrenamiento)
+            print("Inicializando estrategia sin modelo (modo entrenamiento o sin IA).")
 
     def calcular_features(self, velas):
         """
@@ -102,7 +112,7 @@ class EstrategiaAvanzada:
             x = np.arange(len(y))
             slope = np.polyfit(x, y, 1)[0]
             tendencia_direccion = 1 if slope > 0 else -1 if slope < 0 else 0
-            tendencia_fuerza = abs(slope) / df['close'].mean()  # normalizado
+            tendencia_fuerza = abs(slope) / (df['close'].mean() + 1e-6)  # normalizado
         else:
             tendencia_direccion = 0
             tendencia_fuerza = 0.0
@@ -162,6 +172,10 @@ class EstrategiaAvanzada:
         - fuerza de la señal (signal_strength)
         - diccionario completo de features (para depuración)
         """
+        if self.modelo is None or self.scaler is None:
+            # Si no hay modelo, devolvemos valores por defecto
+            return 0.5, 0.5, 0, 0.0, None
+
         features_dict = self.calcular_features(velas)
         if features_dict is None:
             return 0.5, 0.5, 0, 0.0, None
