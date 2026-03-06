@@ -432,7 +432,6 @@ with st.expander("📋 Activos OTC detectados"):
     else:
         st.write("No hay activos disponibles.")
 
-# Auto-refresh cada segundo
-st.markdown("""
-    <meta http-equiv="refresh" content="1">
-""", unsafe_allow_html=True)
+# ========== REFRESCO AUTOMÁTICO (CORREGIDO) ==========
+# Reemplaza el meta refresh manual por el mecanismo seguro de Streamlit
+st.experimental_autorefresh(interval=1000, key="autorefresh")
