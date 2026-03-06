@@ -1,0 +1,4 @@
+[service]
+buildCommand = "pip install -r requisitos.txt"
+startCommand = "python aplicación.py"
+port = 8000
