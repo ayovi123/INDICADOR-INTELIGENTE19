@@ -3,223 +3,281 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import time
-import subprocess
-import os
 import pickle
-from datetime import datetime
+from datetime import datetime, timedelta
 from iqoptionapi.stable_api import IQ_Option
 from data_provider import EstrategiaAvanzada
+import threading
+import queue
 
 # ========== CONFIGURACIÓN ==========
 SEGUNDO_EJECUCION = 58
 VELAS_HISTORICAS = 50
+ACTIVO_DESCARGAR = "EURUSD"  # Activo para entrenamiento (puedes parametrizar después)
+TIMEFRAME = 60  # 1 minuto
+VELAS_POR_REQUEST = 1000
+NUM_REQUESTS = 500  # 500 * 1000 = 500,000 velas (ajustable para no exceder tiempos)
 
 # Archivos necesarios
-CSV_FILE = "iqoption_data_EURUSD_60.csv"
 MODELO_FILE = "modelo_xgb.pkl"
 SCALER_FILE = "scaler.pkl"
+CSV_FILE = "iqoption_data_EURUSD_60.csv"
 
-# ========== FUNCIONES AUXILIARES ==========
-def ejecutar_script(script_name, mensaje):
-    """Ejecuta un script Python y muestra el resultado en Streamlit."""
-    with st.spinner(f"{mensaje}..."):
-        result = subprocess.run(['python', script_name], capture_output=True, text=True)
-        if result.returncode == 0:
-            st.success(f"{mensaje} completado.")
-            with st.expander(f"Salida de {script_name}"):
-                st.text(result.stdout)
-            return True
-        else:
-            st.error(f"Error en {mensaje}: {result.stderr}")
-            return False
+# ========== FUNCIONES DE DESCARGA Y ENTRENAMIENTO ==========
 
-def obtener_activos_otc_desde_api():
+def descargar_datos(api, activo, total_requests, progress_callback):
     """
-    Obtiene dinámicamente la lista de activos OTC disponibles desde IQ Option.
-    Usa las credenciales de Secrets (descarga) o las de sesión según contexto.
+    Descarga velas históricas usando la API ya conectada.
+    progress_callback: función para actualizar progreso.
+    Retorna el DataFrame con las velas.
     """
-    try:
-        # Para obtener activos, usamos Secrets (es más simple y no requiere sesión activa)
-        email = os.environ.get('IQ_EMAIL')
-        password = os.environ.get('IQ_PASSWORD')
-        
-        if not email or not password:
-            # Si no hay Secrets, intentamos con las credenciales de sesión (si existen)
-            if 'iq_api' in st.session_state:
-                api_temp = st.session_state.iq_api
-            else:
-                st.error("No hay credenciales disponibles para obtener activos")
-                return []
-        else:
-            api_temp = IQ_Option(email, password)
-            api_temp.connect()
-        
-        api_temp.update_ACTIVES_OPCODE()
-        activos_dict = api_temp.get_all_ACTIVES_OPCODE()
-        
-        # Filtrar solo activos OTC
-        activos_otc = [nombre for nombre in activos_dict.keys() if "-OTC" in nombre]
-        
-        # No cerramos sesión si es la misma de st.session_state
-        if email and password and 'iq_api' not in st.session_state:
-            api_temp.logout()
-            
-        return activos_otc
+    todas_las_velas = []
+    end_from = int(time.time())
     
-    except Exception as e:
-        st.error(f"Error al obtener activos OTC: {e}")
-        return []
+    for i in range(total_requests):
+        to_time = end_from - i * VELAS_POR_REQUEST * TIMEFRAME
+        try:
+            velas = api.get_candles(activo, TIMEFRAME, VELAS_POR_REQUEST, to_time)
+            if velas:
+                df_batch = pd.DataFrame(velas)
+                df_batch = df_batch[['from', 'open', 'max', 'min', 'close', 'volume']]
+                df_batch.columns = ['from', 'open', 'high', 'low', 'close', 'volume']
+                todas_las_velas.append(df_batch)
+            
+            # Actualizar progreso
+            progress_callback((i + 1) / total_requests)
+            time.sleep(0.3)  # Pequeña pausa para no saturar
+        except Exception as e:
+            st.warning(f"Error en lote {i+1}: {e}")
+            time.sleep(1)
+    
+    if not todas_las_velas:
+        return None
+    
+    df_final = pd.concat(todas_las_velas, ignore_index=True)
+    df_final = df_final.drop_duplicates(subset=['from'])
+    df_final = df_final.sort_values('from').reset_index(drop=True)
+    return df_final
 
-# ========== VERIFICACIÓN INICIAL (Descarga y Entrenamiento) ==========
+def entrenar_modelo_con_datos(df):
+    """
+    Toma el DataFrame descargado, genera features y entrena XGBoost.
+    Guarda modelo.pkl y scaler.pkl.
+    """
+    from sklearn.preprocessing import StandardScaler
+    import xgboost as xgb
+    from sklearn.metrics import accuracy_score
+    
+    # Crear target
+    df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
+    df = df.dropna(subset=['target']).reset_index(drop=True)
+    
+    # Instanciar estrategia (sin modelo)
+    estrategia = EstrategiaAvanzada(modelo_path=None, scaler_path=None, ventana=20)
+    
+    features_list = []
+    targets_list = []
+    
+    for i in range(20, len(df)):
+        ventana_df = df.iloc[i-20:i][['open','high','low','close','volume']]
+        feat = estrategia.calcular_features(ventana_df)
+        if feat is not None:
+            features_list.append(feat)
+            targets_list.append(df.iloc[i]['target'])
+    
+    if len(features_list) < 100:
+        raise ValueError("No hay suficientes muestras para entrenar.")
+    
+    X = pd.DataFrame(features_list)
+    y = pd.Series(targets_list)
+    
+    # División temporal
+    split = int(len(X) * 0.8)
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+    
+    # Escalado
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Entrenar
+    modelo = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        random_state=42,
+        n_jobs=-1,
+        eval_metric='logloss',
+        use_label_encoder=False
+    )
+    modelo.fit(X_train_scaled, y_train, eval_set=[(X_test_scaled, y_test)], verbose=False)
+    
+    # Evaluar
+    y_pred = modelo.predict(X_test_scaled)
+    acc = accuracy_score(y_test, y_pred)
+    st.info(f"Precisión en validación: {acc:.4f}")
+    
+    # Guardar
+    with open(MODELO_FILE, 'wb') as f:
+        pickle.dump(modelo, f)
+    with open(SCALER_FILE, 'wb') as f:
+        pickle.dump(scaler, f)
+    
+    return modelo, scaler
+
+# ========== INTERFAZ DE LOGIN (SIEMPRE VISIBLE) ==========
 st.set_page_config(layout="wide")
 st.title("🤖 Indicador Inteligente IQ Option con IA")
 
-# Verificar Secrets (para descarga de datos)
-secrets_ok = False
-if 'IQ_EMAIL' in st.secrets and 'IQ_PASSWORD' in st.secrets:
-    os.environ['IQ_EMAIL'] = st.secrets['IQ_EMAIL']
-    os.environ['IQ_PASSWORD'] = st.secrets['IQ_PASSWORD']
-    secrets_ok = True
-    st.success("✅ Credenciales de Secrets configuradas correctamente.")
-else:
-    st.warning("⚠️ Secrets no configurados. La descarga automática de datos no funcionará.")
-
-# 1. Verificar y descargar datos si es necesario (usa Secrets)
-if secrets_ok and not os.path.exists(CSV_FILE):
-    st.info("📥 Archivo de datos no encontrado. Iniciando descarga desde IQ Option...")
-    if not ejecutar_script('descargador_iq.py', "Descarga de datos"):
-        st.stop()
-elif not os.path.exists(CSV_FILE):
-    st.error("❌ No hay archivo de datos y no hay Secrets para descargarlo. Sube manualmente el CSV.")
-    st.stop()
-else:
-    st.success("✅ Archivo de datos encontrado.")
-
-# 2. Verificar y entrenar modelo si es necesario
-if not (os.path.exists(MODELO_FILE) and os.path.exists(SCALER_FILE)):
-    st.info("🧠 Modelo no encontrado. Iniciando entrenamiento de IA...")
-    if not ejecutar_script('entrenador_ia.py', "Entrenamiento de IA"):
-        st.stop()
-else:
-    st.success("✅ Modelo y scaler encontrados.")
-
-# 3. Cargar modelo y scaler en session_state
-try:
-    with open(MODELO_FILE, 'rb') as f:
-        st.session_state['modelo'] = pickle.load(f)
-    with open(SCALER_FILE, 'rb') as f:
-        st.session_state['scaler'] = pickle.load(f)
-    st.success("✅ Modelo cargado correctamente en la sesión.")
-except Exception as e:
-    st.error(f"❌ Error al cargar modelo: {e}")
-    st.stop()
-
-# ========== INTERFAZ DE LOGIN DEL USUARIO (para operar) ==========
+# Sidebar de conexión
 with st.sidebar:
     st.header("🔐 Conexión a IQ Option")
     
-    if 'usuario_conectado' not in st.session_state:
+    if 'iq_api' not in st.session_state:
+        st.session_state.iq_api = None
         st.session_state.usuario_conectado = False
     
     if not st.session_state.usuario_conectado:
-        email_user = st.text_input("Email", key="email_user")
-        password_user = st.text_input("Contraseña", type="password", key="password_user")
+        email_user = st.text_input("Email", key="email_login")
+        password_user = st.text_input("Contraseña", type="password", key="password_login")
         tipo_cuenta = st.selectbox("Tipo de cuenta", ["PRACTICE", "REAL"])
         
         if st.button("Conectar"):
             with st.spinner("Conectando..."):
-                try:
-                    api_user = IQ_Option(email_user, password_user)
-                    check, reason = api_user.connect()
-                    if check:
-                        api_user.change_balance(tipo_cuenta)
-                        st.session_state.iq_api = api_user
-                        st.session_state.usuario_conectado = True
-                        st.session_state.email_user = email_user
-                        st.session_state.tipo_cuenta = tipo_cuenta
-                        st.success("✅ Conectado correctamente")
-                        st.rerun()
-                    else:
-                        st.error(f"Error: {reason}")
-                except Exception as e:
-                    st.error(f"Error: {e}")
+                api = IQ_Option(email_user, password_user)
+                check, reason = api.connect()
+                if check:
+                    api.change_balance(tipo_cuenta)
+                    st.session_state.iq_api = api
+                    st.session_state.usuario_conectado = True
+                    st.session_state.email_user = email_user
+                    st.success("✅ Conectado")
+                    st.rerun()
+                else:
+                    st.error(f"Error: {reason}")
     else:
         st.success(f"Conectado como: {st.session_state.email_user}")
-        st.info(f"Cuenta: {st.session_state.tipo_cuenta}")
         if st.button("Desconectar"):
-            if 'iq_api' in st.session_state:
+            if st.session_state.iq_api:
                 st.session_state.iq_api.logout()
+            st.session_state.iq_api = None
             st.session_state.usuario_conectado = False
             st.rerun()
 
-# ========== CLASES DEL BOT (adaptadas para usar la sesión del usuario) ==========
+# ========== VERIFICACIÓN DE MODELOS Y BOTÓN DE ENTRENAMIENTO ==========
+
+modelos_existen = os.path.exists(MODELO_FILE) and os.path.exists(SCALER_FILE)
+
+if not modelos_existen:
+    if st.session_state.usuario_conectado:
+        st.warning("⚠️ Los archivos del modelo de IA no existen. Necesitas descargar datos históricos y entrenar el modelo.")
+        if st.button("📥 Descargar datos históricos y entrenar IA", type="primary"):
+            # Crear contenedores para progreso
+            status = st.status("Iniciando descarga...", expanded=True)
+            
+            # Cola para comunicación con el hilo de descarga
+            progress_queue = queue.Queue()
+            
+            def progress_callback(p):
+                progress_queue.put(p)
+            
+            # Iniciar descarga en un hilo para no bloquear
+            def tarea_descarga():
+                df = descargar_datos(
+                    st.session_state.iq_api,
+                    ACTIVO_DESCARGAR,
+                    NUM_REQUESTS,
+                    progress_callback
+                )
+                progress_queue.put(("completa", df))
+            
+            thread = threading.Thread(target=tarea_descarga)
+            thread.start()
+            
+            # Monitor de progreso
+            progreso_bar = status.progress(0, text="Descargando velas...")
+            while thread.is_alive():
+                try:
+                    val = progress_queue.get(timeout=0.5)
+                    if isinstance(val, tuple) and val[0] == "completa":
+                        df_descargado = val[1]
+                        break
+                    else:
+                        progreso_bar.progress(val, text=f"Descargando... {val*100:.1f}%")
+                except queue.Empty:
+                    pass
+            
+            if df_descargado is None:
+                status.error("Error en la descarga. No se pudo continuar.")
+                st.stop()
+            
+            # Guardar CSV
+            df_descargado.to_csv(CSV_FILE, index=False)
+            status.update(label="Descarga completada. Iniciando entrenamiento...", state="running")
+            
+            # Entrenar modelo
+            try:
+                modelo, scaler = entrenar_modelo_con_datos(df_descargado)
+                status.update(label="✅ Entrenamiento completado con éxito", state="complete", expanded=False)
+                st.success("Modelo entrenado y guardado. La aplicación se recargará para usarlo.")
+                time.sleep(2)
+                st.rerun()
+            except Exception as e:
+                status.update(label=f"Error en entrenamiento: {e}", state="error")
+                st.stop()
+    else:
+        st.info("🔌 Conéctate a IQ Option para poder descargar datos y entrenar el modelo.")
+        st.stop()
+else:
+    st.success("✅ Modelo de IA cargado y listo para operar.")
+
+# ========== CLASES DEL BOT (usando la sesión activa) ==========
 
 class DataManager:
-    """Gestor de datos que obtiene activos dinámicamente y velas reales usando la sesión del usuario"""
+    """Obtiene activos dinámicos y velas en tiempo real usando la sesión activa."""
     
     def __init__(self):
         self.historial = {}
         self.ultima_actualizacion_activos = 0
         self.activos_cache = []
-        
+    
     def obtener_activos_disponibles(self):
-        """Obtiene activos OTC usando la sesión activa del usuario o Secrets como fallback"""
         ahora = time.time()
         if ahora - self.ultima_actualizacion_activos > 300:  # 5 minutos
-            if st.session_state.usuario_conectado and 'iq_api' in st.session_state:
-                # Usar sesión del usuario
+            if st.session_state.usuario_conectado and st.session_state.iq_api:
                 api = st.session_state.iq_api
                 try:
                     api.update_ACTIVES_OPCODE()
                     activos_dict = api.get_all_ACTIVES_OPCODE()
                     self.activos_cache = [nombre for nombre in activos_dict.keys() if "-OTC" in nombre]
-                except:
-                    # Fallback a método estático
-                    self.activos_cache = obtener_activos_otc_desde_api()
+                except Exception as e:
+                    st.warning(f"Error actualizando activos: {e}")
+                    self.activos_cache = []
             else:
-                # Fallback a Secrets
-                self.activos_cache = obtener_activos_otc_desde_api()
-            
+                self.activos_cache = []
             self.ultima_actualizacion_activos = ahora
-            
-            # Inicializar historial para nuevos activos
-            for activo in self.activos_cache:
-                if activo not in self.historial:
-                    self.historial[activo] = []
-        
         return self.activos_cache
-
+    
     def obtener_velas(self, activo, count=VELAS_HISTORICAS):
-        """
-        Obtiene velas reales de IQ Option usando la sesión del usuario si está conectado.
-        Si no, usa simulación (modo offline/demo).
-        """
-        if st.session_state.usuario_conectado and 'iq_api' in st.session_state:
-            # MODO REAL: Obtener velas de la API
+        """Obtiene velas reales usando la sesión activa. Si falla, usa simulación."""
+        if st.session_state.usuario_conectado and st.session_state.iq_api:
             try:
                 api = st.session_state.iq_api
                 end_from = int(time.time())
                 velas = api.get_candles(activo, 60, count, end_from)
-                
                 if velas:
                     df = pd.DataFrame(velas)
                     df = df[['from', 'open', 'max', 'min', 'close', 'volume']]
                     df.columns = ['from', 'open', 'high', 'low', 'close', 'volume']
-                    # Guardar en historial
                     self.historial[activo] = df
                     return df
-                else:
-                    # Si falla, usar simulación como fallback
-                    return self._simular_velas(activo, count)
             except Exception as e:
-                st.warning(f"Error obteniendo velas reales de {activo}: {e}. Usando simulación.")
-                return self._simular_velas(activo, count)
-        else:
-            # MODO SIMULACIÓN (para pruebas sin conexión)
-            return self._simular_velas(activo, count)
+                st.warning(f"Error obteniendo velas de {activo}, usando simulación: {e}")
+        # Fallback a simulación
+        return self._simular_velas(activo, count)
     
     def _simular_velas(self, activo, count):
-        """Genera velas simuladas (para desarrollo/pruebas)"""
         if activo not in self.historial or len(self.historial[activo]) < count:
             precio = np.random.uniform(1.0, 1.2)
             velas = []
@@ -238,125 +296,82 @@ class DataManager:
         return df
 
 class IQOptionBot:
-    """Bot principal - ANALIZA TODOS LOS ACTIVOS OTC DISPONIBLES"""
-    
     def __init__(self):
         self.data_manager = DataManager()
-        self.estrategia = EstrategiaAvanzada(
-            modelo_path=MODELO_FILE,
-            scaler_path=SCALER_FILE,
-            ventana=20
-        )
+        self.estrategia = EstrategiaAvanzada(MODELO_FILE, SCALER_FILE, ventana=20)
         self.historial_analisis = []
         self.ultima_senal = None
         self.contador_ciclos = 0
-
+    
     def ejecutar_ciclo(self):
-        """Ejecuta un ciclo de análisis sobre TODOS los activos OTC disponibles"""
-        
-        # Obtener activos disponibles en tiempo real
-        activos_a_analizar = self.data_manager.obtener_activos_disponibles()
-        
-        if not activos_a_analizar:
+        activos = self.data_manager.obtener_activos_disponibles()
+        if not activos:
             return
-        
         self.contador_ciclos += 1
-        
-        # Analizar cada activo disponible
-        for activo in activos_a_analizar:
+        for activo in activos:
             try:
                 velas = self.data_manager.obtener_velas(activo)
                 analisis = self.estrategia.analizar_activo(velas)
                 analisis['activo'] = activo
                 analisis['timestamp'] = datetime.now().strftime('%H:%M:%S')
-                analisis['ciclo'] = self.contador_ciclos
-
-                # Agregar al historial
                 self.historial_analisis.append(analisis)
                 if len(self.historial_analisis) > 50:
                     self.historial_analisis.pop(0)
-
-                # Si es buena señal, guardar como última
                 if analisis['es_bueno']:
                     self.ultima_senal = analisis
-                    # Aquí iría la ejecución de orden real (si el usuario está conectado)
                     if st.session_state.usuario_conectado:
-                        self._ejecutar_orden_real(analisis)
-                    
+                        self._ejecutar_orden(analisis)
             except Exception as e:
-                print(f"Error analizando {activo}: {e}")
-                continue
+                print(f"Error en {activo}: {e}")
+    
+    def _ejecutar_orden(self, analisis):
+        # Aquí colocarías la lógica real de trading
+        pass
 
-    def _ejecutar_orden_real(self, analisis):
-        """Ejecuta una orden real usando la sesión del usuario"""
-        try:
-            api = st.session_state.iq_api
-            direccion = analisis['sentimiento'].lower()
-            monto = 1  # Monto fijo por ahora, podrías hacerlo configurable
-            
-            # Ejemplo para binarias de 1 minuto
-            status, order_id = api.buy(monto, analisis['activo'], direccion, 1)
-            
-            if status:
-                st.success(f"✅ Orden ejecutada: {analisis['activo']} {direccion.upper()} - ID: {order_id}")
-            else:
-                st.error(f"❌ Error ejecutando orden")
-        except Exception as e:
-            st.error(f"Error en orden: {e}")
-
-# ========== INICIALIZACIÓN DEL BOT ==========
+# ========== INICIALIZAR BOT EN SESSION STATE ==========
 if 'bot' not in st.session_state:
     st.session_state.bot = IQOptionBot()
     st.session_state.ultimo_segundo = -1
 
 bot = st.session_state.bot
 
-# ========== BUCLE PRINCIPAL ==========
+# ========== BUCLE PRINCIPAL (se ejecuta cada segundo con meta refresh) ==========
 placeholder = st.empty()
-
-# Obtener el segundo actual
 now = datetime.now()
 segundo_actual = now.second
 
-# Ejecutar ciclo solo en el segundo 58 (y solo si el usuario está conectado O si estamos en modo demo)
 if segundo_actual == SEGUNDO_EJECUCION and st.session_state.ultimo_segundo != segundo_actual:
     bot.ejecutar_ciclo()
     st.session_state.ultimo_segundo = segundo_actual
 
 # ========== INTERFAZ DE USUARIO ==========
 with placeholder.container():
-    # Cabecera con información
-    col1, col2 = st.columns([3, 1])
+    col1, col2 = st.columns([3,1])
     with col1:
         if st.session_state.usuario_conectado:
-            st.markdown(f"## ⚡ **BOT ACTIVO - CONECTADO A IQ OPTION**")
+            st.markdown(f"## ⚡ **BOT ACTIVO - CONECTADO**")
         else:
             st.markdown(f"## 🔍 **BOT EN MODO DEMO (sin conexión)**")
     with col2:
         st.markdown(f"**{now.strftime('%Y-%m-%d %H:%M:%S')}**")
         st.markdown(f"**Ciclo #{bot.contador_ciclos}**")
-
-    # Panel principal: dos columnas
+    
     col_left, col_right = st.columns(2)
-
+    
     with col_left:
         st.subheader("📊 Últimos análisis")
-        
-        # Obtener activos disponibles para mostrar
-        activos_disponibles = bot.data_manager.obtener_activos_disponibles()
-        st.metric("Activos OTC detectados", len(activos_disponibles))
-        
-        # Mostrar tabla con últimos 10 análisis
+        activos = bot.data_manager.obtener_activos_disponibles()
+        st.metric("Activos OTC", len(activos))
         if bot.historial_analisis:
-            df_ultimos = pd.DataFrame(bot.historial_analisis[-10:])
-            display_df = df_ultimos[['timestamp', 'activo', 'sentimiento', 'fuerza', 'prob_CALL', 'prob_PUT']].copy()
-            display_df['fuerza'] = display_df['fuerza'].apply(lambda x: f"{x:.2%}")
-            display_df['prob_CALL'] = display_df['prob_CALL'].apply(lambda x: f"{x:.2%}")
-            display_df['prob_PUT'] = display_df['prob_PUT'].apply(lambda x: f"{x:.2%}")
-            st.dataframe(display_df, use_container_width=True)
+            df_hist = pd.DataFrame(bot.historial_analisis[-10:])
+            df_display = df_hist[['timestamp','activo','sentimiento','fuerza','prob_CALL','prob_PUT']].copy()
+            df_display['fuerza'] = df_display['fuerza'].apply(lambda x: f"{x:.2%}")
+            df_display['prob_CALL'] = df_display['prob_CALL'].apply(lambda x: f"{x:.2%}")
+            df_display['prob_PUT'] = df_display['prob_PUT'].apply(lambda x: f"{x:.2%}")
+            st.dataframe(df_display, use_container_width=True)
         else:
             st.info("Esperando análisis...")
-
+    
     with col_right:
         st.subheader("🔔 Última señal")
         if bot.ultima_senal:
@@ -365,23 +380,21 @@ with placeholder.container():
             - **Activo:** {s['activo']} - **{s['sentimiento']}**
             - **Probabilidad:** CALL {s['prob_CALL']:.2%} / PUT {s['prob_PUT']:.2%}
             - **Fuerza:** {s['fuerza']:.2%} - {s['magnitud_esperada']}
-            - **Volumen (presión):** {s['volumen']:.2f}
+            - **Volumen:** {s['volumen']:.2f}
             - **Tendencia:** {'Sí' if s['tiene_tendencia'] else 'No'}
             """)
-            
             if s['es_bueno']:
-                st.success("✅ SEÑAL FAVORABLE DETECTADA")
+                st.success("✅ SEÑAL FAVORABLE")
         else:
-            st.info("Esperando primera señal...")
-
-    # Mostrar lista de activos disponibles
-    with st.expander("📋 Activos OTC disponibles actualmente"):
-        if activos_disponibles:
-            st.write(", ".join(activos_disponibles))
+            st.info("Esperando señal...")
+    
+    with st.expander("📋 Activos OTC detectados"):
+        if activos:
+            st.write(", ".join(activos))
         else:
-            st.write("No se pudieron obtener activos. Verifica conexión.")
+            st.write("No hay activos disponibles.")
 
-# Auto-refresh cada segundo
+# Meta refresh cada segundo
 st.markdown("""
     <meta http-equiv="refresh" content="1">
 """, unsafe_allow_html=True)
